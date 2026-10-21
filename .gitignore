@@ -218,9 +218,11 @@ __marimo__/
 .streamlit/secrets.toml
 
 # project data and outputs
+docs/adr/
 data/**
 !data/**/
 !data/**/.gitkeep
+!data/README.md
 outputs/**
 !outputs/**/
 !outputs/**/.gitkeep

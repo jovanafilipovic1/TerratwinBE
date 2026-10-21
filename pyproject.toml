@@ -1,13 +1,18 @@
 [project]
-name = "terratwinbe"
+name = "bandstack"
 version = "0.1.0"
-description = "Add your description here"
+description = "Bandstack of environmental predictors for the Flemish Region (TerraTwin Belgian use case)"
 readme = "README.md"
 authors = [
     { name = "jfilipovic", email = "jovana.filipovic@ilvo.vlaanderen.be" }
 ]
 requires-python = ">=3.13"
-dependencies = []
+dependencies = [
+    "geopandas>=1.2.0",
+    "matplotlib>=3.11.2",
+    "pyproj>=3.8.0",
+    "rasterio>=1.5.2",
+]
 
 [build-system]
 requires = ["uv_build>=0.11.16,<0.12.0"]
