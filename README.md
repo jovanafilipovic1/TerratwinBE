@@ -10,10 +10,11 @@ The Belgian use case of the TerraTwin project: Impact of Compound Flooding on So
 
 ## Repository layout
 
-- `data/` — raw data store; see [data/README.md](data/README.md) for the
-  source catalog (contents are gitignored, the catalog is not)
-- `notebooks/` — per-source exploration and fetch notebooks
-- `src/bandstack/` — pipeline code that maps the environmental predictors onto a common 200m grid
+- `data/` — raw and aligned data stores; see [data/README.md](data/README.md)
+  for the source catalog (contents are gitignored, the catalog is not)
+- `notebooks/` — per-source exploration notebooks (the first fetches)
+- `src/bandstack/` — the pipeline: fetches Sources, aligns them onto the
+  common 200 m grid, and assembles the Bandstack (run: `python -m bandstack`)
 
 ## Setup
 Requires [uv](https://docs.astral.sh/uv/).

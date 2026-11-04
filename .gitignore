@@ -219,6 +219,7 @@ __marimo__/
 
 # project data and outputs
 docs/adr/
+teaching/
 data/**
 !data/**/
 !data/**/.gitkeep

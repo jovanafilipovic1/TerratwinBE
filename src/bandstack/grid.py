@@ -41,9 +41,9 @@ class GridSpec:
     """
 
     crs: CRS
-    transform: Affine
-    width: int
-    height: int
+    transform: Affine  # transforms a raster (col, row) to real-world coordinates (x,y)
+    width: int  # how many columns the raster has
+    height: int  # how many rows the raster has
 
     def __post_init__(self) -> None:
         """Validate the invariants every Bandstack layer relies on."""
@@ -92,7 +92,7 @@ class GridSpec:
         """Integer ``f`` such that ``f x f`` cells of ``finer`` tile exactly into
         one cell of this grid (exact nesting, no resampling).
 
-        Used in bandstack assembly (ADR-0004): derived predictors are computed
+        Used in bandstack assembly: derived predictors are computed
         on the 10 m Linda-anchored master grid, then folded onto the 200 m
         Bandstack grid — here ``f = 20`` — as a pure integer reshape
         (per-class fractions, mean of distances). Raises instead of silently
@@ -132,7 +132,7 @@ def from_bounds_snapped(
     Snapping matters because every resolution we use (10 m master, 200 m
     Bandstack) must share one lattice anchored on whole-kilometre lines: the
     200 m grid then nests exactly 20:1 into the 10 m master grid, and both
-    land on Linda's native lattice, so loading Linda is a pure clip (ADR-0004).
+    land on Linda's native lattice, so loading Linda is a pure clip.
     Snapping *outward* (floor on the low edges, ceil on the high edges)
     guarantees the buffered extent is fully covered, and makes the grid a
     deterministic function of the mask geometry — small changes in the input
