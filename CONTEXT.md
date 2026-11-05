@@ -42,6 +42,21 @@ and undecoded. Alignment onto the common grid happens later; a raw store is
 never masked or resampled in place.
 _Avoid_: raw data (vague), downloads
 
+**Fetch Artifact**:
+A nodata cell written by our own fetch, not a gap in the published Source
+— e.g. a miswindowed read or a failed tile read. Invisible at write time;
+caught only by the fetch gate (live second read, cell-for-cell) or a drift
+from the Provenance Record reference fractions. A verified re-fetch
+removes it.
+_Avoid_: gap (reserved for published gaps)
+
+**Published Gap**:
+A cell the Source itself publishes as nodata (e.g. SoilGrids' built-up and
+water masking). A permanent Source characteristic, recorded once per layer
+in the Provenance Record; re-fetching never fills it, and the modelling
+domain excludes it wherever any Predictor has one.
+_Avoid_: fetch artifact (that one is ours and fixable)
+
 **Catalog**:
 The human-maintained inventory of Sources (`data/README.md`): what we fetch
 and why, and licenses. Records
