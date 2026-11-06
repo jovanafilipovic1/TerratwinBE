@@ -7,7 +7,7 @@ mask is applied at fetch time — every pixel is real published data, so the
 bilinear warp kernels of border cells are fully populated. The Study Area
 mask is applied once, at align time, on the target grid.
 
-Fetch verification gate (ADR 0001): GDAL writes a failed tile read as
+Fetch verification gate: GDAL writes a failed tile read as
 nodata, indistinguishable from a published gap at write time. After every
 fetch, each layer's valid mask is therefore compared cell-for-cell with a
 second, live read of one representative layer per mask group (published
@@ -16,7 +16,7 @@ whole group). A cell valid live but nodata on disk is a proven fetch
 artifact: the affected group is refetched, at most ``MAX_VERIFY_ATTEMPTS``
 times per layer, then the run fails loudly. Verified per-layer valid
 fractions are recorded in the raw Provenance Record as the reference for
-later fetches (ADR 0001 decision 1).
+later fetches.
 """
 
 from __future__ import annotations
@@ -91,7 +91,7 @@ CITIES: dict[str, tuple[float, float]] = {
     "Hasselt": (5.34, 50.93),
 }
 
-# Verification gates (ADR 0001): every layer's valid mask is compared with a
+# Verification gates: every layer's valid mask is compared with a
 # live second read (fetch gate), and its valid-inside fraction must reproduce
 # the Provenance Record reference within REF_TOL (fraction gate).
 REF_TOL = 0.01
@@ -228,7 +228,7 @@ def verify_raw_store(
                 raise RuntimeError(
                     f"fetch verification failed for {layer} after {max_attempts} attempts; "
                     "the live source disagrees with every refetch — investigate before "
-                    "trusting the raw store (ADR 0001 decision 1)"
+                    "trusting the raw store"
                 )
         for layer in sorted(failing):
             refetch(layer)
@@ -241,7 +241,7 @@ def reference_fraction_violations(
     tol: float = REF_TOL,
 ) -> list[str]:
     """Layers whose measured valid-inside fraction drifted from the recorded
-    reference by more than ``tol`` (ADR 0001 decision 1 fraction gate)."""
+    reference by more than ``tol`` (fraction gate)."""
     return [
         f"{layer}: {measured[layer]:.4f} vs reference {reference[layer]:.4f}"
         for layer in measured
@@ -288,7 +288,7 @@ def _load_previous_records() -> tuple[dict[str, dict], str | None]:
 
 def distribution_file_date() -> str | None:
     """``Last-Modified`` of one layer VRT: the vintage of the frozen 'latest'
-    distribution (ADR 0001 decision 5)."""
+    distribution (frozen snapshot)."""
     prop = LAYERS[0].split("_", 1)[0]
     req = urllib.request.Request(f"{BASE_URL}/{prop}/{LAYERS[0]}.vrt", method="HEAD")
     try:
@@ -370,7 +370,7 @@ def fetch_raw(grid: GridSpec, *, force: bool = False) -> list[str]:
 
     # Per-layer valid fractions: window-wide, and inside the Study Area —
     # the latter is the recorded reference for later fetches and the
-    # align-time consistency check (ADR 0001 decisions 1–2). Each layer's
+    # align-time consistency check. Each layer's
     # Study Area mask is rasterized on that layer's own grid: the two
     # published grid families are offset by 3 px.
     layer_fractions: dict[str, dict] = {}
@@ -395,9 +395,7 @@ def fetch_raw(grid: GridSpec, *, force: bool = False) -> list[str]:
     if reference and dist_date and prev_date == dist_date:
         violations = reference_fraction_violations(measured_inside, reference)
         if violations:
-            raise RuntimeError(
-                "valid-fraction gate failed (ADR 0001 decision 1): " + "; ".join(violations)
-            )
+            raise RuntimeError("valid-fraction gate failed: " + "; ".join(violations))
 
     groups = group_by_mask(masks)
     print(
@@ -433,7 +431,7 @@ def fetch_raw(grid: GridSpec, *, force: bool = False) -> list[str]:
         "verification": {
             "method": (
                 "live second read of one representative per mask group, compared "
-                "cell-for-cell (ADR 0001 decision 1); group members refetched on "
+                "cell-for-cell; group members refetched on "
                 "mismatch"
             ),
             "mask_groups": [list(g) for g in groups],
@@ -564,7 +562,7 @@ def verify_aligned(
         ph = ds.read(ph_idx + 1)
     spread = max(s["valid_inside"] for s in stats) - min(s["valid_inside"] for s in stats)
 
-    # Reference consistency (ADR 0001 decision 1): every band's valid fraction
+    # Reference consistency: every band's valid fraction
     # inside the Study Area must reproduce the raw store's verified reference.
     # Replaces the refuted NaN=sea gates, which passed the artifacted fetch.
     try:
@@ -592,7 +590,7 @@ def verify_aligned(
         )
     checks.append({"name": "reference consistency", "ok": ok, "detail": detail})
 
-    # Modelling domain (ADR 0001 decision 3): cells where all bands are
+    # Modelling domain: cells where all bands are
     # finite. Informational — the domain is defined as exactly these cells.
     with rasterio.open(path) as ds:
         all_finite = np.ones(grid.shape, dtype=bool)

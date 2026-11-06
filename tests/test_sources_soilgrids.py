@@ -77,7 +77,7 @@ def test_window_outward_respects_each_vrt_grids_origin():
     # The published property VRTs form two IGH grid families with origins
     # 750 m (3 px) apart. The same required bounds must therefore map to
     # windows offset by exactly 3 columns — one window reused across both
-    # families was the 2026-11 misregistration bug (ADR 0001 update).
+    # families was the 2026-11 misregistration bug.
     bdod_soc = Affine(250.0, 0.0, -19949000.0, 0.0, -250.0, 8361000.0)
     nine_props = Affine(250.0, 0.0, -19949750.0, 0.0, -250.0, 8361000.0)
     req = (1267000.0, 2925000.0, 1276000.0, 3020000.0)
