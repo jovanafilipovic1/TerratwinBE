@@ -27,11 +27,9 @@ uv sync
 
 ## Usage
 
-Fetch, align, verify, and record:
-
 ```bash
 uv run python -m bandstack
 ```
 
 Add `--force` to re-read every raw layer from its Source even if the stored
-files already cover the required bounds (the fetch gate runs either way).
+files already cover the required bounds.
