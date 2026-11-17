@@ -1,4 +1,4 @@
-"""SoilGrids Source: inventory, raw fetch, fetch gate, alignment, verification.
+"""SoilGrids Source adapter: inventory, live reads, alignment, verification.
 
 Raw store bounding policy: the fetch window is the target-grid extent
 (Study Area bbox + buffer, Lambert 72) transformed into SoilGrids' native
@@ -7,36 +7,34 @@ mask is applied at fetch time — every pixel is real published data, so the
 bilinear warp kernels of border cells are fully populated. The Study Area
 mask is applied once, at align time, on the target grid.
 
-Fetch verification gate: GDAL writes a failed tile read as
-nodata, indistinguishable from a published gap at write time. After every
-fetch, each layer's valid mask is therefore compared cell-for-cell with a
-second, live read of one representative layer per mask group (published
-masks are shared within a property batch, so one comparison certifies the
-whole group). A cell valid live but nodata on disk is a proven fetch
-artifact: the affected group is refetched, at most ``MAX_VERIFY_ATTEMPTS``
-times per layer, then the run fails loudly. Verified per-layer valid
-fractions are recorded in the raw Provenance Record as the reference for
-later fetches.
+The fetch process around this adapter — idempotent fetch, the fetch gate
+(live second read of one representative per mask group), the fraction
+gate, and the raw Provenance Record — is owned by ``bandstack.rawstore``;
+this module supplies the SoilGrids specifics through its interface.
 """
 
 from __future__ import annotations
 
-import hashlib
 import json
 import math
 import urllib.request
-from collections.abc import Callable, Sequence
-from datetime import UTC, datetime
 from pathlib import Path
 
 import numpy as np
 import rasterio
 from rasterio.crs import CRS
 from rasterio.warp import Resampling, transform, transform_bounds
-from rasterio.windows import Window, from_bounds
+from rasterio.windows import Window
 
 from bandstack.align import warp_band
-from bandstack.grid import REPO_ROOT, GridSpec, study_area_mask
+from bandstack.grid import REPO_ROOT, GridSpec
+from bandstack.rawstore import (
+    REF_TOL,
+    ensure,
+    raw_reference_fractions,
+    reference_fraction_violations,
+    window_outward,
+)
 
 BASE_URL = "https://files.isric.org/soilgrids/latest/data"
 CRS_IGH = CRS.from_proj4("+proj=igh +R=6371000 +units=m +no_defs")
@@ -91,11 +89,8 @@ CITIES: dict[str, tuple[float, float]] = {
     "Hasselt": (5.34, 50.93),
 }
 
-# Verification gates: every layer's valid mask is compared with a
-# live second read (fetch gate), and its valid-inside fraction must reproduce
-# the Provenance Record reference within REF_TOL (fraction gate).
-REF_TOL = 0.01
-MAX_VERIFY_ATTEMPTS = 3
+# Verification tolerances (align-time checks): city spot check vs raw
+# interpolation, and the texture-closure median gate.
 INTERP_TOL = 0.05
 CLOSURE_MEDIAN_MAX = 10.0
 
@@ -124,168 +119,6 @@ def required_bounds_igh(grid: GridSpec, pad_m: float = PAD_M) -> tuple[float, fl
     return (w - pad_m, s - pad_m, e + pad_m, n + pad_m)
 
 
-def window_outward(transform: rasterio.Affine, req: tuple[float, float, float, float]) -> Window:
-    """Integer window on a ``transform`` grid covering ``req`` bounds, rounded
-    outward (floor on low edges, ceil on high edges) so no data is lost."""
-    # On the raster described by this transform, which pixels cover this
-    # geographic area? The answer comes in fractional pixels (e.g. columns
-    # 12.34 to 61.20).
-    win = from_bounds(*req, transform)
-    col0 = math.floor(win.col_off)
-    row0 = math.floor(win.row_off)
-    col1 = math.ceil(win.col_off + win.width)
-    row1 = math.ceil(win.row_off + win.height)
-    return Window(col0, row0, col1 - col0, row1 - row0)
-
-
-def file_covers(path: Path, req: tuple[float, float, float, float], eps: float = 1e-6) -> bool:
-    """True if the raster at ``path`` covers the required bounds (w, s, e, n)."""
-    with rasterio.open(path) as ds:
-        w, s, e, n = ds.bounds
-    return w <= req[0] + eps and s <= req[1] + eps and e >= req[2] - eps and n >= req[3] - eps
-
-
-def _live_window(
-    layer: str, req: tuple[float, float, float, float]
-) -> tuple[Window, rasterio.Affine]:
-    """(window, transform) of ``layer`` over the required bounds, on the
-    layer's *own* VRT grid: the published property VRTs do not share one grid
-    — the bdod/soc family and the 9-property family differ by 750 m (3 px) in
-    origin — so every layer must be windowed on its own transform."""
-    with rasterio.open(vrt_url(layer)) as src:
-        win = window_outward(src.transform, req)
-        return win, src.window_transform(win)
-
-
-def _read_live(layer: str, req: tuple[float, float, float, float]) -> np.ndarray:
-    """One live read of ``layer`` over the required bounds (int16, undecoded)."""
-    win, _ = _live_window(layer, req)
-    with rasterio.open(vrt_url(layer)) as src:
-        return src.read(1, window=win).astype("int16")
-
-
-def _read_mask(path: Path) -> np.ndarray:
-    """Valid mask (True = data) of one raw-store layer file."""
-    with rasterio.open(path) as ds:
-        arr = ds.read(1)
-    return arr != NODATA
-
-
-def group_by_mask(masks: dict[str, np.ndarray]) -> list[list[str]]:
-    """Partition layers into groups with bit-identical valid masks.
-
-    Groups keep first-occurrence order, layers keep input order — so each
-    group's representative (``group[0]``) is deterministic.
-    """
-    groups: dict[str, list[str]] = {}
-    for layer, mask in masks.items():
-        key = hashlib.sha1(mask.tobytes()).hexdigest()
-        groups.setdefault(key, []).append(layer)
-    return list(groups.values())
-
-
-def verify_raw_store(
-    layers: Sequence[str],
-    *,
-    load_mask: Callable[[str], np.ndarray],
-    read_live: Callable[[str], np.ndarray],
-    refetch: Callable[[str], None],
-    max_attempts: int = MAX_VERIFY_ATTEMPTS,
-) -> dict[str, np.ndarray]:
-    """Certify every layer's on-disk valid mask against a live second read.
-
-    Layers are grouped by bit-identical masks; one representative per group
-    is read live. The distribution is static, so the live read is ground
-    truth: a cell valid live but nodata on disk is a proven fetch artifact
-    (failed tile read), a cell valid on disk but nodata live means the live
-    read itself failed. Either disagreement refetches the whole group (all
-    members share the mask that failed). After ``max_attempts`` failures
-    attributed to a layer the run fails loudly.
-
-    Returns the verified masks per layer.
-    """
-    attempts: dict[str, int] = dict.fromkeys(layers, 0)
-    masks = {layer: load_mask(layer) for layer in layers}
-    while True:
-        failing: set[str] = set()
-        for group in group_by_mask(masks):
-            rep = group[0]
-            live = read_live(rep) != NODATA
-            disk = masks[rep]
-            n_artifact = int((live & ~disk).sum())
-            n_ghost = int((disk & ~live).sum())
-            if n_artifact or n_ghost:
-                print(
-                    f"gate: {rep} (group of {len(group)}): {n_artifact} artifact, "
-                    f"{n_ghost} ghost cells vs live read -> refetch group"
-                )
-                failing.update(group)
-        if not failing:
-            return masks
-        for layer in failing:
-            attempts[layer] += 1
-            if attempts[layer] > max_attempts:
-                raise RuntimeError(
-                    f"fetch verification failed for {layer} after {max_attempts} attempts; "
-                    "the live source disagrees with every refetch — investigate before "
-                    "trusting the raw store"
-                )
-        for layer in sorted(failing):
-            refetch(layer)
-            masks[layer] = load_mask(layer)
-
-
-def reference_fraction_violations(
-    measured: dict[str, float],
-    reference: dict[str, float],
-    tol: float = REF_TOL,
-) -> list[str]:
-    """Layers whose measured valid-inside fraction drifted from the recorded
-    reference by more than ``tol`` (fraction gate)."""
-    return [
-        f"{layer}: {measured[layer]:.4f} vs reference {reference[layer]:.4f}"
-        for layer in measured
-        if layer in reference and abs(measured[layer] - reference[layer]) > tol
-    ]
-
-
-def raw_reference_fractions(raw_dir: Path | None = None) -> dict[str, float]:
-    """Per-layer valid-inside-Study-Area fractions recorded by the last
-    verified fetch (raw Provenance Record)."""
-    path = (raw_dir if raw_dir is not None else RAW_DIR) / "_metadata.json"
-    with open(path) as f:
-        meta = json.load(f)
-    return {rec["name"]: rec["valid_frac_inside"] for rec in meta.get("layers", [])}
-
-
-def next_fetched_at(
-    layer: str,
-    written: set[str],
-    previous: dict[str, dict],
-    run_at: str,
-) -> str | None:
-    """Per-layer fetch timestamp: now if (re)written this run; the previous
-    record's value if the file was kept; None if kept with no known history."""
-    if layer in written:
-        return run_at
-    return previous.get(layer, {}).get("fetched_at")
-
-
-def _load_previous_records() -> tuple[dict[str, dict], str | None]:
-    """Per-layer records and distribution file date from the existing raw
-    Provenance Record, if there is one ({} if absent or unreadable)."""
-    path = RAW_DIR / "_metadata.json"
-    if not path.exists():
-        return {}, None
-    try:
-        with open(path) as f:
-            meta = json.load(f)
-    except json.JSONDecodeError:
-        return {}, None
-    layers = {rec["name"]: rec for rec in meta.get("layers", []) if "name" in rec}
-    return layers, meta.get("distribution", {}).get("file_last_modified")
-
-
 def distribution_file_date() -> str | None:
     """``Last-Modified`` of one layer VRT: the vintage of the frozen 'latest'
     distribution (frozen snapshot)."""
@@ -300,157 +133,79 @@ def distribution_file_date() -> str | None:
 
 
 def fetch_raw(grid: GridSpec, *, force: bool = False) -> list[str]:
-    """Ensure the raw store covers ``grid`` and passes the fetch gate.
+    """Ensure the SoilGrids raw store covers ``grid`` and passes the fetch gate.
 
-    Idempotent: existing files whose extent covers the required IGH bounds
-    are kept (their per-layer ``fetched_at`` survives). ``force=True``
-    re-reads every layer from the distribution. Every run ends with the
-    verification gate (see module docstring), so kept files are re-certified
-    against the live source, never trusted on extent alone. Returns the
-    list of layers (re)written.
+    Thin adapter over ``rawstore.ensure``: the generic process (idempotent
+    fetch, gate, fraction gate, Provenance Record) lives there; everything
+    here is SoilGrids — live reads windowed on each layer's own IGH grid,
+    the nodata sentinel, and the Record prose. Returns the list of layers
+    (re)written.
     """
     req: tuple[float, float, float, float] = required_bounds_igh(grid)
-    RAW_DIR.mkdir(parents=True, exist_ok=True)
-    previous, prev_date = _load_previous_records()
-    run_at = datetime.now(UTC).isoformat(timespec="seconds")
-    written: list[str] = []
 
-    def fetch_layer(layer: str) -> None:
-        arr = _read_live(layer, req)
-        _, win_transform = _live_window(layer, req)
-        profile = dict(
-            driver="GTiff",
-            height=arr.shape[0],
-            width=arr.shape[1],
-            count=1,
-            dtype="int16",
-            crs=CRS_IGH,
-            transform=win_transform,
-            nodata=NODATA,
-            compress="deflate",
-        )
-        out_path = RAW_DIR / f"{layer}.tif"
-        with rasterio.open(out_path, "w", **profile) as dst:
-            dst.write(arr, 1)
-        if not file_covers(out_path, req):
-            raise RuntimeError(f"{layer}: written window does not cover the required bounds")
-        if layer not in written:
-            written.append(layer)
+    def fetch_one(layer: str) -> tuple[np.ndarray, dict]:
+        """One live read of ``layer`` over ``req`` (int16, undecoded), on the
+        layer's *own* VRT grid: the published property VRTs do not share one
+        grid — the bdod/soc family and the 9-property family differ by 750 m
+        (3 px) in origin — so every layer must be windowed on its own
+        transform."""
+        with rasterio.open(vrt_url(layer)) as src:
+            win = window_outward(src.transform, req)
+            arr = src.read(1, window=win).astype("int16")
+            profile = dict(
+                driver="GTiff",
+                height=arr.shape[0],
+                width=arr.shape[1],
+                count=1,
+                dtype="int16",
+                crs=CRS_IGH,
+                transform=src.window_transform(win),
+                nodata=NODATA,
+                compress="deflate",
+            )
+        return arr, profile
 
     with rasterio.Env(**GDAL_ENV):
-        with rasterio.open(vrt_url(layer=LAYERS[0])) as first:
+        with rasterio.open(vrt_url(LAYERS[0])) as first:
             win = window_outward(first.transform, req)  # which pixels cover our rectangle?
         print(
             f"raw window ≈{int(win.width)}×{int(win.height)} px "
             f"(≈{win.width * RES_M / 1000:.0f}×{win.height * RES_M / 1000:.0f} km, "
             f"unmasked rectangle, per-layer windows on each VRT's own grid)"
         )
-        for layer in LAYERS:
-            out_path = RAW_DIR / f"{layer}.tif"
-            if out_path.exists() and not force and file_covers(out_path, req):
-                continue
-            fetch_layer(layer)
-            print(f"fetched {layer}")
 
-        gate_rewrites: list[str] = []
-
-        def gate_refetch(layer: str) -> None:
-            fetch_layer(layer)
-            gate_rewrites.append(layer)
-            print(f"gate refetch {layer}")
-
-        masks = verify_raw_store(
-            LAYERS,
-            load_mask=lambda layer: _read_mask(RAW_DIR / f"{layer}.tif"),
-            read_live=lambda layer: _read_live(layer, req),
-            refetch=gate_refetch,
-        )
-
-    dist_date = distribution_file_date()
-
-    # Per-layer valid fractions: window-wide, and inside the Study Area —
-    # the latter is the recorded reference for later fetches and the
-    # align-time consistency check. Each layer's
-    # Study Area mask is rasterized on that layer's own grid: the two
-    # published grid families are offset by 3 px.
-    layer_fractions: dict[str, dict] = {}
-    for layer in LAYERS:
-        with rasterio.open(RAW_DIR / f"{layer}.tif") as ds:
-            layer_grid = GridSpec(
-                crs=CRS_IGH, transform=ds.transform, width=ds.width, height=ds.height
-            )
-            layer_bounds = list(ds.bounds)
-        inside = study_area_mask(layer_grid)
-        layer_fractions[layer] = {
-            "window_bounds_igh": layer_bounds,
-            "valid_frac_window": float(masks[layer].mean()),
-            "valid_frac_inside": float(masks[layer][inside].sum() / inside.sum()),
-        }
-    measured_inside = {layer: layer_fractions[layer]["valid_frac_inside"] for layer in LAYERS}
-    reference = {
-        layer: rec["valid_frac_inside"]
-        for layer, rec in previous.items()
-        if "valid_frac_inside" in rec
-    }
-    if reference and dist_date and prev_date == dist_date:
-        violations = reference_fraction_violations(measured_inside, reference)
-        if violations:
-            raise RuntimeError("valid-fraction gate failed: " + "; ".join(violations))
-
-    groups = group_by_mask(masks)
-    print(
-        f"gate passed: {len(groups)} mask group(s), sizes "
-        f"{[len(g) for g in groups]}; every mask certified against a live second read"
+    return ensure(
+        layers=LAYERS,
+        raw_dir=RAW_DIR,
+        required_bounds=req,
+        fetch_one=fetch_one,
+        nodata=NODATA,
+        vintage=distribution_file_date,
+        env=GDAL_ENV,
+        bounds_key="window_bounds_igh",
+        force=force,
+        record=dict(
+            source="SoilGrids 2.0 (ISRIC), 'latest' WebDAV distribution",
+            distribution_note="'latest' is a frozen snapshot; this date is its vintage",
+            base_url=BASE_URL,
+            statistic="mean",
+            grid={
+                "crs_proj4": CRS_IGH.to_proj4(),
+                "resolution_m": RES_M,
+                "bounding_policy": (
+                    "unmasked rectangle: target-grid extent transformed to IGH, "
+                    f"padded {PAD_M:g} m, snapped outward to whole pixels; per-layer "
+                    "windows on each VRT's own grid (two published grid families, "
+                    "origins 750 m apart — see per-layer window_bounds_igh)"
+                ),
+            },
+            value_encoding="ISRIC int16, undecoded",
+            decode_factors={
+                prop: UNITS[prop][0]
+                for prop in sorted({layer.split("_", 1)[0] for layer in LAYERS})
+            },
+        ),
     )
-
-    metadata = {
-        "source": "SoilGrids 2.0 (ISRIC), 'latest' WebDAV distribution",
-        "run_at": run_at,
-        "distribution": {
-            "file_last_modified": dist_date,
-            "note": "'latest' is a frozen snapshot; this date is its vintage",
-        },
-        "base_url": BASE_URL,
-        "layer_inventory": LAYERS,
-        "statistic": "mean",
-        "grid": {
-            "crs_proj4": CRS_IGH.to_proj4(),
-            "resolution_m": RES_M,
-            "bounding_policy": (
-                "unmasked rectangle: target-grid extent transformed to IGH, "
-                f"padded {PAD_M:g} m, snapped outward to whole pixels; per-layer "
-                "windows on each VRT's own grid (two published grid families, "
-                "origins 750 m apart — see per-layer window_bounds_igh)"
-            ),
-        },
-        "nodata": NODATA,
-        "value_encoding": "ISRIC int16, undecoded",
-        "decode_factors": {
-            prop: UNITS[prop][0] for prop in sorted({layer.split("_", 1)[0] for layer in LAYERS})
-        },
-        "verification": {
-            "method": (
-                "live second read of one representative per mask group, compared "
-                "cell-for-cell; group members refetched on "
-                "mismatch"
-            ),
-            "mask_groups": [list(g) for g in groups],
-            "refetched_by_gate": gate_rewrites,
-        },
-        "layers": [
-            {
-                "name": layer,
-                "fetched_at": next_fetched_at(layer, set(written), previous, run_at),
-                **layer_fractions[layer],
-            }
-            for layer in LAYERS
-        ],
-    }
-    with open(RAW_DIR / "_metadata.json", "w") as f:
-        json.dump(metadata, f, indent=2)
-    n_fetched = len(written)
-    print(f"raw store ready ({n_fetched} written, {len(LAYERS)} verified)")
-    return written
 
 
 def align(
@@ -566,7 +321,7 @@ def verify_aligned(
     # inside the Study Area must reproduce the raw store's verified reference.
     # Replaces the refuted NaN=sea gates, which passed the artifacted fetch.
     try:
-        references = raw_reference_fractions()
+        references = raw_reference_fractions(RAW_DIR)
     except (OSError, KeyError, json.JSONDecodeError):
         references = {}
     measured = {s["layer"]: 1.0 - s["nan_inside_frac"] for s in stats}
