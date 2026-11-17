@@ -1,5 +1,9 @@
 """SoilGrids Source adapter: inventory, live reads, alignment, verification.
 
+Public interface: ``fetch_raw`` (ensure a verified raw store, thin call into
+``bandstack.rawstore``) and ``ensure_aligned`` (align → verify → Provenance
+Record in one call).
+
 Raw store bounding policy: the fetch window is the target-grid extent
 (Study Area bbox + buffer, Lambert 72) transformed into SoilGrids' native
 IGH grid, padded and snapped *outward* to whole source pixels. No polygon
@@ -18,6 +22,7 @@ from __future__ import annotations
 import json
 import math
 import urllib.request
+from datetime import UTC, datetime
 from pathlib import Path
 
 import numpy as np
@@ -27,7 +32,7 @@ from rasterio.warp import Resampling, transform, transform_bounds
 from rasterio.windows import Window
 
 from bandstack.align import warp_band
-from bandstack.grid import REPO_ROOT, GridSpec
+from bandstack.grid import GridSpec
 from bandstack.rawstore import (
     REF_TOL,
     ensure,
@@ -42,6 +47,7 @@ NODATA = -32768
 RES_M = 250.0
 PAD_M = 500.0
 
+REPO_ROOT = Path(__file__).resolve().parents[3]
 RAW_DIR = REPO_ROOT / "data" / "raw" / "soilgrids"
 ALIGNED_DIR = REPO_ROOT / "data" / "aligned" / "soilgrids"
 ALIGNED_NAME = "soilgrids_lambert72_200m.tif"
@@ -212,6 +218,7 @@ def align(
     grid: GridSpec,
     *,
     raw_dir: Path | None = None,
+    out_dir: Path | None = None,
     resampling: Resampling = Resampling.bilinear,
 ) -> tuple[Path, list[dict]]:
     """Warp every raw layer onto ``grid`` into one multiband float32 GeoTIFF.
@@ -221,8 +228,9 @@ def align(
     and per-band statistics for verification.
     """
     raw_dir = raw_dir if raw_dir is not None else RAW_DIR
-    ALIGNED_DIR.mkdir(parents=True, exist_ok=True)
-    out_path = ALIGNED_DIR / ALIGNED_NAME
+    out_dir = out_dir if out_dir is not None else ALIGNED_DIR
+    out_dir.mkdir(parents=True, exist_ok=True)
+    out_path = out_dir / ALIGNED_NAME
     mask = grid.mask()
     stats: list[dict] = []
     with rasterio.open(
@@ -266,14 +274,14 @@ def align(
     return out_path, stats
 
 
-def _raw_bilinear(layer: str, x: float, y: float) -> float:
+def _raw_bilinear(layer: str, x: float, y: float, *, raw_dir: Path) -> float:
     """Textbook bilinear of the raw store at an IGH coordinate, mirroring the
     warp kernel. Partial kernels (some of the 2×2 pixels nodata) are
     renormalized over the valid pixels — this is what the GDAL warper does
     (verified empirically 2026-11-04); NaN only when the whole kernel is
     nodata. Uses centre-based fractional indices — rasterio affines are
     edge-based, pixel centres sit at col + 0.5."""
-    with rasterio.open(RAW_DIR / f"{layer}.tif") as ds:
+    with rasterio.open(raw_dir / f"{layer}.tif") as ds:
         fc, fr = ~ds.transform * (x, y)
         uc, ur = fc - 0.5, fr - 0.5
         c0, r0 = math.floor(uc), math.floor(ur)
@@ -291,8 +299,11 @@ def verify_aligned(
     path: Path,
     stats: list[dict],
     grid: GridSpec,
+    *,
+    raw_dir: Path | None = None,
 ) -> list[dict]:
     """Run the post-align checks; returns a list of {name, ok, detail}."""
+    raw_dir = raw_dir if raw_dir is not None else RAW_DIR
     checks: list[dict] = []
 
     with rasterio.open(path) as ds:
@@ -321,7 +332,7 @@ def verify_aligned(
     # inside the Study Area must reproduce the raw store's verified reference.
     # Replaces the refuted NaN=sea gates, which passed the artifacted fetch.
     try:
-        references = raw_reference_fractions(RAW_DIR)
+        references = raw_reference_fractions(raw_dir)
     except (OSError, KeyError, json.JSONDecodeError):
         references = {}
     measured = {s["layer"]: 1.0 - s["nan_inside_frac"] for s in stats}
@@ -378,7 +389,7 @@ def verify_aligned(
         cx = grid.transform.c + (c + 0.5) * grid.res
         cy = grid.transform.f - (r + 0.5) * grid.res
         xi, yi = transform(grid.crs, CRS_IGH, [cx], [cy])
-        ref = _raw_bilinear("phh2o_0-5cm_mean", xi[0], yi[0])
+        ref = _raw_bilinear("phh2o_0-5cm_mean", xi[0], yi[0], raw_dir=raw_dir)
         if city == "Brussels":
             ok = math.isnan(a)
             city_lines.append(f"{city}: aligned {a:.2f} (expected NaN — outside Study Area)")
@@ -433,4 +444,63 @@ def verify_aligned(
         }
     )
 
+    return checks
+
+
+def _grid_fingerprint(grid: GridSpec) -> dict:
+    """The target grid as recorded in the Aligned Source Provenance Record."""
+    return {
+        "crs": grid.crs.to_string(),
+        "transform": [
+            grid.transform.a,
+            grid.transform.b,
+            grid.transform.c,
+            grid.transform.d,
+            grid.transform.e,
+            grid.transform.f,
+        ],
+        "width": grid.width,
+        "height": grid.height,
+    }
+
+
+def ensure_aligned(
+    grid: GridSpec,
+    *,
+    raw_dir: Path | None = None,
+    out_dir: Path | None = None,
+) -> list[dict]:
+    """Align, verify, and record the SoilGrids Aligned Source in one call.
+
+    Warps the raw store onto ``grid`` (``align``), prints the per-band
+    summary, runs the post-align checks (``verify_aligned``), and writes the
+    Aligned Source Provenance Record beside the stack — the Record is owned
+    by the code that aligns. Returns the checks; the caller decides what to
+    do with failures.
+    """
+    path, stats = align(grid, raw_dir=raw_dir, out_dir=out_dir)
+
+    print("\nper-band summary (inside Study Area mask):")
+    for s in stats:
+        print(
+            f"  {s['layer']:26s} valid {1 - s['nan_inside_frac']:6.1%} "
+            f"[{s['min']:8.2f}, {s['max']:8.2f}] {s['unit']}"
+        )
+
+    checks = verify_aligned(path, stats, grid, raw_dir=raw_dir)
+
+    sidecar = {
+        "created_at": datetime.now(UTC).isoformat(timespec="seconds"),
+        "grid": _grid_fingerprint(grid),
+        "source": "SoilGrids 2.0 (ISRIC) via data/raw/soilgrids (see raw _metadata.json)",
+        "resampling": "bilinear (one warp per layer, native IGH -> target grid)",
+        "encoding": "float32, decoded physical units, NaN nodata",
+        "mask": "Study Area (GISCO NUTS 2021 BE2), all_touched=True, applied at align",
+        "bands": stats,
+        "verification": checks,
+    }
+    sidecar_path = path.parent / "_metadata.json"
+    with open(sidecar_path, "w") as f:
+        json.dump(sidecar, f, indent=2)
+    print(f"\nsidecar written: {sidecar_path}")
     return checks

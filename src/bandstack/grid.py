@@ -25,8 +25,8 @@ from rasterio.crs import CRS
 from rasterio.features import rasterize
 from rasterio.transform import Affine
 
-REPO_ROOT = Path(__file__).resolve().parents[2]  # Two directories up from this file
-STUDY_AREA_GEOJSON = REPO_ROOT / "data" / "raw" / "gisco" / "be2_flemish_region_4326.geojson"
+_REPO_ROOT = Path(__file__).resolve().parents[2]  # Two directories up from this file
+STUDY_AREA_GEOJSON = _REPO_ROOT / "data" / "raw" / "gisco" / "be2_flemish_region_4326.geojson"
 BUFFER_M = 1000.0
 LAMBERT72 = CRS.from_epsg(31370)
 ETRS89_LAEA = CRS.from_epsg(3035)
