@@ -41,6 +41,10 @@ def _ramp_source(path):
 
 
 def test_bilinear_reproduces_linear_ramp(tmp_path):
+    """Bilinear warp of a linear ramp is mathematically exact: target col c
+    centres midway between source cols 2c and 2c+1, so the answer is 2c+0.5.
+    Edge columns get slack: GDAL renormalizes the kernel at the raster edge,
+    which production avoids by padding the raw window (PAD_M)."""
     src = tmp_path / "ramp.tif"
     _ramp_source(src)
     mask = np.ones((20, 20), dtype=bool)
@@ -55,6 +59,8 @@ def test_bilinear_reproduces_linear_ramp(tmp_path):
 
 
 def test_decode_factor_divides(tmp_path):
+    """Decoding after the warp is an exact division by the factor — warp
+    (bilinear) and decode (linear) commute, pinning the align contract."""
     src = tmp_path / "ramp.tif"
     _ramp_source(src)
     mask = np.ones((20, 20), dtype=bool)
@@ -64,6 +70,9 @@ def test_decode_factor_divides(tmp_path):
 
 
 def test_source_nodata_propagates_as_nan(tmp_path):
+    """A target cell whose whole 2×2 kernel is nodata becomes NaN, while
+    partially covered kernels are renormalized over the valid cells — GDAL's
+    documented behaviour, pinned here so kernel handling changes surface."""
     src = tmp_path / "hole.tif"
     arr = np.ones((40, 40), dtype="int16")
     arr[:, 10:16] = -32768  # 600 m-wide block of nodata
@@ -78,6 +87,8 @@ def test_source_nodata_propagates_as_nan(tmp_path):
 
 
 def test_mask_outside_is_nan(tmp_path):
+    """Cells outside the mask are NaN regardless of underlying data — masking
+    happens last, after the warp, so no nodata bleeds into border kernels."""
     src = tmp_path / "ramp.tif"
     _ramp_source(src)
     mask = np.zeros((20, 20), dtype=bool)
@@ -88,6 +99,9 @@ def test_mask_outside_is_nan(tmp_path):
 
 
 def test_cross_crs_warp_of_constant(tmp_path):
+    """A constant value survives a degree-based (EPSG:4326) to metre-based
+    (Lambert 72) warp exactly — a known answer under any correct reprojection,
+    exercising the CRS machinery production uses for IGH -> Lambert 72."""
     src = tmp_path / "const_4326.tif"
     w, s, e, n = transform_bounds(L72, CRS.from_epsg(4326), 0.0, 0.0, 4000.0, 4000.0)
     res = 0.001

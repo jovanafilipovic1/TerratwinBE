@@ -64,7 +64,7 @@ def file_covers(path: Path, req: tuple[float, float, float, float], eps: float =
     """True if the raster at ``path`` covers the required bounds (w, s, e, n)."""
     with rasterio.open(path) as ds:
         w, s, e, n = ds.bounds
-    return w <= req[0] + eps and s <= req[1] + eps and e >= req[2] - eps and n >= req[3] + eps
+    return w <= req[0] + eps and s <= req[1] + eps and e >= req[2] - eps and n >= req[3] - eps
 
 
 def _load_mask(path: Path, nodata: int | float) -> np.ndarray:

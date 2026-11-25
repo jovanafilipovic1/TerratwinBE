@@ -91,11 +91,59 @@ published GeoTIFF is already decoded; do not rescale it.
   fetched**
 
 
+## Landgebruik Vlaanderen — toestand 2025 ("Linda")
+
+| | |
+|---|---|
+| What | Actual land use per 10 m cell — one band, cell values are categorical class codes, 19 classes (legend below) |
+| URL | `https://dataplatform.omgeving.vlaanderen.be/public/mercatornet/lu_landgebruik_vlaa_2025_v3/lu_landgebruik_vlaa_2025_v3?format=tiff` |
+| Version | `lu_landgebruik_vlaa_2025_v3` — version-pinned name, published 2026-06; the platform serves no Last-Modified/ETag, so the Provenance Record pins the download's sha256 as the vintage |
+| Access | Whole-file GeoTIFF download. **Decision**: no WCS (GetCoverage broken on the endpoint and capped at 78 MB) and no windowed `/vsicurl` reads (no Range support); answers are rate-limited, so the fetch downloads once per run |
+| Native grid | EPSG:31370, 10 m, 23 700 × 9 200, origin (22 000, 245 000) — extent trimmed to the Flemish Region bbox (earlier state years carry a wider house grid) |
+| Values | int32 class codes 1–19, undecoded; nodata −9999 |
+| License | Flemish open data — free reuse with attribution (Departement Omgeving / MercatorNet) |
+| Local | `data/raw/linda/` — the full published raster (the padded fetch window exceeds the published extent, so nothing is cut); inventory, sha and fractions in the `_metadata.json` sidecar |
+
+### Classes
+
+Fetched as published (Dutch labels); English glosses are ours, for reading
+only. The legend is verified against the publisher's live SLD style at
+every fetch.
+
+| Code | Label | Gloss |
+|---|---|---|
+| 1 | Huizen en tuinen | Houses and gardens |
+| 2 | Industrie | Industry |
+| 3 | Commerciële doeleinden | Commercial |
+| 4 | Diensten | Services |
+| 5 | Transportinfrastructuur | Transport infrastructure |
+| 6 | Recreatie | Recreation |
+| 7 | Landbouwgebouwen en -infrastructuur | Farm buildings and infrastructure |
+| 8 | Overige bebouwde terreinen | Other built-up land |
+| 9 | Overige onbebouwde terreinen | Other unbuilt land |
+| 10 | Actieve groeves | Active quarries |
+| 11 | Luchthavens | Airports |
+| 12 | Bos | Forest |
+| 13 | Akker | Arable land |
+| 14 | Grasland in landbouwgebruik | Grassland in agricultural use |
+| 15 | Struikgewas | Shrubs |
+| 16 | Braakliggend en duinen | Bare land and dunes |
+| 17 | Water | Water |
+| 18 | Moeras | Marsh |
+| 19 | Overige graslanden | Other grasslands |
+
+### State year
+
+**Decision**: fetch the single latest state year only (2025 v3), the
+phase-1 scope; earlier state years (2013–2022) are not fetched. Distance
+and fraction predictors will be derived from this one state; a multi-year
+land-use history is a possible later extension.
+
+
 ## Planned sources (not yet fetched)
 
 | Source | Content | Native grid | Status |
 |---|---|---|---|
-| Linda ("Landgebruik Vlaanderen") | Land use (categorical), single latest state year | EPSG:31370, 10 m, GeoTIFF | planned — anchors the 10 m master grid |
 | LUCAS-derived EU rasters (ESDAC) | Topsoil properties interpolated from LUCAS points | EPSG:3035, 500 m | planned — Predictor candidates |
 | Climate | temporal climate predictors | varies, ~1 km+ | planned |
 ...
